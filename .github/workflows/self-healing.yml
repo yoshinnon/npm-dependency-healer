@@ -1,0 +1,399 @@
+name: Self-Healing CI
+
+on:
+  push:
+    branches-ignore:
+      - main
+  pull_request:
+    branches:
+      - main
+      - '**'
+
+# ループ防止: ai-fix ブランチからのトリガーを除外
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ================================================================
+  # JOB 1: Feature/Fix ブランチ向け - 自動修復CI
+  # ================================================================
+  auto-fix-ci:
+    name: Auto-Fix CI (non-main branches)
+    # main へのPR または ai-fixブランチ自身は除外
+    if: |
+      github.ref != 'refs/heads/main' &&
+      !contains(github.ref, '_ai-fix-') &&
+      github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+
+    steps:
+      # ── ループ防止: bot によるコミットをスキップ ──────────────────
+      - name: Skip if triggered by bot
+        if: github.actor == 'github-actions[bot]'
+        run: |
+          echo "::notice::Triggered by github-actions[bot]. Skipping to prevent loop."
+          exit 0
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      # ── GitHub CLI + Copilot Extension ───────────────────────────
+      - name: Setup GitHub CLI & Copilot extension
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          gh extension install github/gh-copilot --force 2>/dev/null || true
+          echo "GH Copilot extension ready"
+
+      # ── Step 1: npm install ──────────────────────────────────────
+      - name: Step 1 - npm install
+        id: install
+        run: |
+          npm install 2>&1 | tee /tmp/install.log
+          echo "exit_code=${PIPESTATUS[0]}" >> $GITHUB_OUTPUT
+
+      # ── Step 2: lint --fix ───────────────────────────────────────
+      - name: Step 2 - lint fix
+        id: lint
+        if: steps.install.outputs.exit_code == '0'
+        run: |
+          npm run lint -- --fix 2>&1 | tee /tmp/lint.log || true
+          npm run lint 2>&1 | tee -a /tmp/lint.log
+          echo "exit_code=${PIPESTATUS[0]}" >> $GITHUB_OUTPUT
+
+      # ── Step 3: typecheck ────────────────────────────────────────
+      - name: Step 3 - typecheck
+        id: typecheck
+        if: steps.install.outputs.exit_code == '0'
+        run: |
+          npm run typecheck 2>&1 | tee /tmp/typecheck.log
+          echo "exit_code=${PIPESTATUS[0]}" >> $GITHUB_OUTPUT
+
+      # ── Step 4: test ─────────────────────────────────────────────
+      - name: Step 4 - test
+        id: test
+        if: steps.install.outputs.exit_code == '0'
+        run: |
+          npm test 2>&1 | tee /tmp/test.log
+          echo "exit_code=${PIPESTATUS[0]}" >> $GITHUB_OUTPUT
+
+      # ── 全テスト成功 → そのまま終了（AI修復不要）────────────────
+      - name: All checks passed (no fix needed)
+        if: |
+          steps.install.outputs.exit_code == '0' &&
+          steps.lint.outputs.exit_code == '0' &&
+          steps.typecheck.outputs.exit_code == '0' &&
+          steps.test.outputs.exit_code == '0'
+        run: echo "::notice::All checks passed! No AI fix needed."
+
+      # ── いずれかのステップが失敗 → AI修復ループ（最大3回）────────
+      # ai-fix.sh 内部で「修正適用 → 再テスト」を最大3回繰り返す。
+      # スクリプトは再テスト成否に関わらず exit 0 で終了する。
+      # （PRは必ず作成するため、ここでワークフローを止めない）
+      - name: AI Fix - repair loop (max 3 retries)
+        id: ai-fix
+        if: |
+          steps.install.outputs.exit_code != '0' ||
+          steps.lint.outputs.exit_code != '0' ||
+          steps.typecheck.outputs.exit_code != '0' ||
+          steps.test.outputs.exit_code != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          # 初回エラーログを集約
+          {
+            echo "=== INSTALL LOG ==="
+            cat /tmp/install.log 2>/dev/null || echo "(no log)"
+            echo ""
+            echo "=== LINT LOG ==="
+            cat /tmp/lint.log 2>/dev/null || echo "(no log)"
+            echo ""
+            echo "=== TYPECHECK LOG ==="
+            cat /tmp/typecheck.log 2>/dev/null || echo "(no log)"
+            echo ""
+            echo "=== TEST LOG ==="
+            cat /tmp/test.log 2>/dev/null || echo "(no log)"
+          } > /tmp/all-errors.log
+
+          chmod +x scripts/ai-fix.sh
+
+          # ai-fix.sh に修復ループを委譲（MAX_RETRIES=3 はスクリプト側で管理）
+          # スクリプトは全ラウンド終了後に必ず exit 0 を返す。
+          # テスト成否は /tmp/final-status ファイルで伝達する。
+          ERROR_LOG=/tmp/all-errors.log bash scripts/ai-fix.sh
+
+      # ── 修復結果に関わらず ai-fix ブランチ作成 & PR 作成 ────────
+      # 再テスト成否は PRコメントに記載するのみ。修正内容は破棄しない。
+      - name: Create AI-fix branch & PR (always)
+        if: steps.ai-fix.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          BASE_BRANCH: ${{ github.ref_name }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          FIX_BRANCH="${BASE_BRANCH}_ai-fix-${RUN_ID}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$FIX_BRANCH"
+          git add -A
+
+          # 変更がなければ空コミットで記録（差分ゼロでもPRは作る）
+          git diff --cached --quiet && \
+            git commit --allow-empty -m "fix: AI auto-fix attempt for ${BASE_BRANCH} [run ${RUN_ID}] (no code change)" || \
+            git commit -m "fix: AI auto-fix for branch ${BASE_BRANCH} [run ${RUN_ID}]"
+
+          git push origin "$FIX_BRANCH"
+
+          # 最終テスト結果を判定（スクリプトが /tmp/final-status を書き出す）
+          FINAL_STATUS=$(cat /tmp/final-status 2>/dev/null || echo "unknown")
+          if [[ "$FINAL_STATUS" == "passed" ]]; then
+            STATUS_BADGE="## ✅ 修復結果: **成功** — 全テストがパスしました"
+          else
+            STATUS_BADGE="## ⚠️ 修復結果: **未完了** — テストが残存しています（修正は進行中）"
+          fi
+
+          # ラウンド別ログを読み込む
+          ROUNDS_LOG=$(cat /tmp/fix-rounds.log 2>/dev/null || echo "(ラウンドログなし)")
+
+          PR_BODY=$(cat <<EOF
+          ## 🤖 AI Self-Healing Fix Report
+
+          このPRは **Self-Healing CI** によって自動生成されました。
+          元ブランチ: \`${BASE_BRANCH}\` / Run ID: \`${RUN_ID}\`
+
+          ${STATUS_BADGE}
+
+          ---
+
+          ### 📋 初回チェックの結果
+
+          <details>
+          <summary>Step 1: npm install</summary>
+
+          \`\`\`
+          $(cat /tmp/install.log 2>/dev/null | tail -30 || echo "(no log)")
+          \`\`\`
+          </details>
+
+          <details>
+          <summary>Step 2: lint --fix</summary>
+
+          \`\`\`
+          $(cat /tmp/lint.log 2>/dev/null | tail -30 || echo "(no log)")
+          \`\`\`
+          </details>
+
+          <details>
+          <summary>Step 3: typecheck</summary>
+
+          \`\`\`
+          $(cat /tmp/typecheck.log 2>/dev/null | tail -30 || echo "(no log)")
+          \`\`\`
+          </details>
+
+          <details>
+          <summary>Step 4: test</summary>
+
+          \`\`\`
+          $(cat /tmp/test.log 2>/dev/null | tail -30 || echo "(no log)")
+          \`\`\`
+          </details>
+
+          ---
+
+          ### 🔄 AI修復ループの経過（最大3ラウンド）
+
+          <details>
+          <summary>各ラウンドの修復ログ</summary>
+
+          \`\`\`
+          ${ROUNDS_LOG}
+          \`\`\`
+          </details>
+
+          ---
+
+          > ⚠️ AIが生成したコードです。マージ前に必ず差分を確認してください。
+          > テストが未通過の場合でも、修正が進行している可能性があります。
+          EOF
+          )
+
+          gh pr create \
+            --title "🤖 AI Fix: ${BASE_BRANCH} (Run ${RUN_ID})" \
+            --body "$PR_BODY" \
+            --base "$BASE_BRANCH" \
+            --head "$FIX_BRANCH" \
+            --label "ai-fix" || \
+          gh pr create \
+            --title "🤖 AI Fix: ${BASE_BRANCH} (Run ${RUN_ID})" \
+            --body "$PR_BODY" \
+            --base "$BASE_BRANCH" \
+            --head "$FIX_BRANCH"
+
+          echo "::notice::📬 AI-fix PR created: ${FIX_BRANCH} → ${BASE_BRANCH} [status: ${FINAL_STATUS}]"
+
+      # ── ワークフロー自体は最終テスト結果に応じて終了コードを返す ─
+      - name: Report final CI status
+        if: always()
+        run: |
+          FINAL_STATUS=$(cat /tmp/final-status 2>/dev/null || echo "unknown")
+          if [[ "$FINAL_STATUS" == "passed" ]]; then
+            echo "::notice::✅ Self-Healing CI: All tests passed after AI fix."
+            exit 0
+          elif [[ "$FINAL_STATUS" == "unknown" ]]; then
+            # ai-fix ステップ自体がスキップ（初回テスト成功）
+            exit 0
+          else
+            echo "::warning::⚠️ Self-Healing CI: Tests still failing after AI fix. PR has been created for review."
+            exit 1
+          fi
+
+  # ================================================================
+  # JOB 2: main ブランチ向け - Final Build Check & Issue生成
+  # ================================================================
+  main-build-check:
+    name: Final Build Check (main)
+    if: |
+      github.event_name == 'pull_request' &&
+      github.base_ref == 'main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+
+    steps:
+      - name: Skip if triggered by bot
+        if: github.actor == 'github-actions[bot]'
+        run: |
+          echo "::notice::Triggered by bot. Skipping."
+          exit 0
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Setup GitHub CLI & Copilot extension
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          gh extension install github/gh-copilot --force 2>/dev/null || true
+
+      - name: npm install
+        run: npm install
+
+      - name: Final Build
+        id: build
+        run: |
+          npm run build 2>&1 | tee /tmp/build.log
+          echo "exit_code=${PIPESTATUS[0]}" >> $GITHUB_OUTPUT
+
+      # ── ビルド成功 ────────────────────────────────────────────────
+      - name: Build succeeded
+        if: steps.build.outputs.exit_code == '0'
+        run: echo "::notice::✅ Build passed! Ready to merge to main."
+
+      # ── ビルド失敗 → Copilotで分析 → Issue作成 ───────────────────
+      - name: Analyze build error with Copilot
+        id: analyze
+        if: steps.build.outputs.exit_code != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          BUILD_LOG=$(cat /tmp/build.log | tail -80)
+
+          # gh copilot explain でエラー原因を取得
+          EXPLANATION=$(echo "$BUILD_LOG" | \
+            gh copilot explain "以下のNode.jsビルドエラーログを分析し、エラーの原因と修正方法を日本語で詳しく説明してください：\n$BUILD_LOG" \
+            2>/dev/null || echo "Copilot analysis unavailable. Please review the build log manually.")
+
+          # gh copilot suggest で修正コードを取得
+          SUGGESTION=$(echo "$BUILD_LOG" | \
+            gh copilot suggest "以下のビルドエラーを修正するための具体的なコード修正案を提示してください：\n$BUILD_LOG" \
+            2>/dev/null || echo "No suggestion available.")
+
+          # Issue本文を生成
+          ISSUE_BODY=$(cat <<EOF
+          ## 🚨 Build Failure Analysis Report
+
+          **PR**: #${{ github.event.pull_request.number }}
+          **ブランチ**: \`${{ github.head_ref }}\` → \`main\`
+          **Run**: [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+          ---
+
+          ## 📋 ビルドエラーログ
+
+          <details>
+          <summary>npm run build (直近80行)</summary>
+
+          \`\`\`
+          ${BUILD_LOG}
+          \`\`\`
+          </details>
+
+          ---
+
+          ## 🤖 GitHub Copilot による原因分析
+
+          ${EXPLANATION}
+
+          ---
+
+          ## 💡 GitHub Copilot による修正案
+
+          ${SUGGESTION}
+
+          ---
+
+          > このIssueはSelf-Healing CIによって自動生成されました。
+          > main ブランチへのAI自動修正は行われません。人間による確認・修正をお願いします。
+          EOF
+          )
+
+          echo "issue_body<<ISSUE_EOF" >> $GITHUB_OUTPUT
+          echo "$ISSUE_BODY" >> $GITHUB_OUTPUT
+          echo "ISSUE_EOF" >> $GITHUB_OUTPUT
+
+      - name: Create analysis Issue
+        if: steps.build.outputs.exit_code != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          gh issue create \
+            --title "🚨 Build Failure: PR #${{ github.event.pull_request.number }} (${{ github.head_ref }} → main)" \
+            --body "${{ steps.analyze.outputs.issue_body }}" \
+            --label "bug,build-failure" || \
+          gh issue create \
+            --title "🚨 Build Failure: PR #${{ github.event.pull_request.number }} (${{ github.head_ref }} → main)" \
+            --body "${{ steps.analyze.outputs.issue_body }}"
+
+          echo "::notice::📝 Build failure analysis Issue created."
+
+      # ── CIをエラー終了させてマージをブロック ─────────────────────
+      - name: Block merge on build failure
+        if: steps.build.outputs.exit_code != '0'
+        run: |
+          echo "::error::Build failed. Merge to main is blocked."
+          echo "::error::See the newly created Issue for analysis and fix suggestions."
+          exit 1
